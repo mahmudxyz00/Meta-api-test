@@ -1,0 +1,35 @@
+# docker-compose.yml for vibes-api server
+#
+# Usage:
+#   1. Set your vibes.ai cookie:
+#      export VIBES_META_SESSION="your-cookie-value"
+#   2. Set an API key for authentication (optional but recommended):
+#      export VIBES_API_KEY="your-secret-api-key"
+#   3. Start the server:
+#      docker compose up -d
+#   4. Open http://localhost:8000/docs
+
+services:
+  vibes-api:
+    build: .
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - VIBES_META_SESSION=${VIBES_META_SESSION:?VIBES_META_SESSION is required}
+      - VIBES_API_KEY=${VIBES_API_KEY:-}
+      - VIBES_COOKIE_FILE=/data/.vibes_cookie
+      - VIBES_REFRESH_INTERVAL=1500
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - vibes-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  vibes-data:
