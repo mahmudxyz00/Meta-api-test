@@ -209,7 +209,14 @@ class UploadImage(BaseModel):
 
 def _handle_error(e: Exception):
     if isinstance(e, VibesAPIError):
-        raise HTTPException(status_code=e.status or 500, detail=str(e))
+        raise HTTPException(
+            status_code=e.status or 500,
+            detail={
+                "error": str(e),
+                "code": e.code,
+                "response": e.response,
+            },
+        )
     raise HTTPException(status_code=500, detail=str(e))
 
 

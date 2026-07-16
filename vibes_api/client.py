@@ -292,6 +292,7 @@ class VibesClient:
         offset: int = 0,
         sort: str = "newest",
         search: Optional[str] = None,
+        max_retries: int = 3,
     ) -> Dict[str, Any]:
         """List projects in your workspace.
 
@@ -302,7 +303,16 @@ class VibesClient:
         params = {"limit": limit, "offset": offset, "sort": sort}
         if search:
             params["search"] = search
-        return self._get("/api/projects", params=params)
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                return self._get("/api/projects", params=params)
+            except VibesAPIError as e:
+                last_err = e
+                if e.status != 500:
+                    raise
+                time.sleep(1.0 * (attempt + 1))
+        raise last_err  # type: ignore[misc]
 
     def get_project(self, project_id: str) -> dict:
         """Fetch a single project (including composition/timeline)."""
@@ -643,18 +653,67 @@ class VibesClient:
             }
             inputs.append(inp)
 
-        # 3) Trigger generation
-        gen_resp = self._post("/api/generate/videos", json_body={
-            "batchId": batch_id,
-            "inputs": inputs,
-            "config": config,
-        })
-
-        if not poll:
-            return gen_resp
-
-        # 4) Poll for completion
-        return self.poll_batch(batch_id, interval=poll_interval, timeout=poll_timeout)
+        # 3) Trigger generation (with retry for transient GENERATION_FAILED)
+        max_gen_retries = 3
+        last_gen_err = None
+        for gen_attempt in range(max_gen_retries):
+            try:
+                gen_resp = self._post("/api/generate/videos", json_body={
+                    "batchId": batch_id,
+                    "inputs": inputs,
+                    "config": config,
+                })
+                # Check if the response indicates failure
+                if isinstance(gen_resp, dict) and not gen_resp.get("success", True):
+                    # Check if ALL items have errors (total failure)
+                    items = gen_resp.get("items", [])
+                    all_failed = items and all(
+                        item.get("error") and not item.get("imageUrl") and not item.get("videoUrl")
+                        for item in items
+                    )
+                    if all_failed:
+                        last_gen_err = VibesAPIError(
+                            f"Generation failed (attempt {gen_attempt + 1}/{max_gen_retries}): "
+                            f"{gen_resp.get('error', {}).get('detail', 'Unknown error')}",
+                            code=gen_resp.get("error", {}).get("code"),
+                            response=gen_resp,
+                        )
+                        if gen_attempt < max_gen_retries - 1:
+                            time.sleep(2.0 * (gen_attempt + 1))
+                            # Create a new batch for retry
+                            batch_id = self._create_batch(
+                                batch_type="videos",
+                                prompt=prompt,
+                                project_id=project_id,
+                                config=config,
+                                count=variations,
+                            )
+                            time.sleep(1.0)
+                            continue
+                    # Partial failure or success — return the response
+                if not poll:
+                    return gen_resp
+                # 4) Poll for completion
+                return self.poll_batch(batch_id, interval=poll_interval, timeout=poll_timeout)
+            except VibesAPIError as e:
+                last_gen_err = e
+                if e.status == 500 and gen_attempt < max_gen_retries - 1:
+                    time.sleep(2.0 * (gen_attempt + 1))
+                    # Create a new batch for retry
+                    batch_id = self._create_batch(
+                        batch_type="videos",
+                        prompt=prompt,
+                        project_id=project_id,
+                        config=config,
+                        count=variations,
+                    )
+                    time.sleep(1.0)
+                    continue
+                raise
+        # If we get here, all retries failed
+        if last_gen_err:
+            raise last_gen_err
+        raise VibesAPIError("Generation failed after all retries")
 
     def poll_batch(
         self,
@@ -3434,8 +3493,8 @@ class VibesClient:
             True if valid, False otherwise.
         """
         try:
-            resp = self._post("/api/auth/check-token")
-            return bool(resp.get("valid", True))
+            resp = self._get("/api/auth/check-token")
+            return True
         except VibesAPIError as e:
             if e.status == 401:
                 return False
