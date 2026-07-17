@@ -111,20 +111,61 @@ class VibesClient:
     ----------
     meta_session : str
         The value of the ``meta_session`` cookie from your browser.
-        You can grab it from DevTools → Application → Cookies → vibes.ai.
     cookie_ack : bool, default True
-        Whether the cookie consent banner was acknowledged.
     base_url : str, default "https://vibes.ai"
-        Override for self-hosted / staging deployments.
     timeout : int, default 60
-        Default per-request timeout in seconds.
     session : requests.Session, optional
-        Reuse an existing requests.Session (e.g., for connection pooling).
+    auto_refresh : bool, default True
+        Auto-refresh cookie by intercepting Set-Cookie headers.
+    background_refresh : bool, default False
+        Run a background thread that calls /api/auth/me every 25 min.
+    refresh_interval : float, default 1500.0
+        Background refresh interval in seconds.
+    on_cookie_refresh : callable, optional
+        Callback called with new cookie value on refresh.
+    on_session_expired : callable, optional
+        Callback called when session expires (401). Use this to
+        fetch a fresh cookie and call ``update_cookie()``.
+    auto_relogin : bool, default False
+        **EXPERIMENTAL**: Attempt automatic re-login via the OIDC flow
+        when the session expires. Requires ``agent-browser`` CLI to be
+        installed. Only works if the browser has an active Meta session.
+    relogin_browser_url : str, optional
+        URL of the headless browser to use for auto re-login.
+        Defaults to "http://localhost:9222" (Chrome DevTools Protocol).
 
-    Notes
-    -----
-    Cookie-based auth rotates. If you start seeing 401s, fetch a fresh
-    ``meta_session`` from the browser and instantiate a new client.
+    How vibes.ai auth works
+    -----------------------
+    1. **Login**: User clicks "Log In" → browser redirects to
+       ``/api/meta-oidc/start`` → redirects to Meta OIDC → user logs
+       in → Meta redirects back to ``/api/meta-oidc/callback`` →
+       server creates a session and sets ``meta_session`` cookie.
+
+    2. **Session validation**: The web app calls ``/api/auth/check-token``
+       every **5 seconds** and ``/api/auth/me`` every **30 seconds**
+       to check if the session is still valid.
+
+    3. **Session expiry**: When the session expires (~30 min of no
+       activity), API calls return 401. The web app auto-redirects
+       to ``/api/meta-oidc/start`` which re-authenticates via Meta
+       (silently if the user has an active Meta session).
+
+    4. **No sliding session**: Unlike what I initially thought, vibes.ai
+       does NOT send ``Set-Cookie`` on regular API responses. The
+       session has a fixed expiry. The only way to extend it is to
+       make API calls (which the server tracks as "activity") — but
+       the cookie itself doesn't change.
+
+    This client implements
+    ----------------------
+    - ``background_refresh``: calls ``/api/auth/me`` every 25 min to
+      keep the session active (matches the web app's behavior).
+    - ``on_session_expired`` callback: notifies you when 401 occurs
+      so you can provide a fresh cookie.
+    - ``auto_relogin``: uses a headless browser to attempt the OIDC
+      flow automatically (requires ``agent-browser``).
+    - ``update_cookie()``: update the cookie at runtime without
+      recreating the client.
     """
 
     def __init__(
@@ -139,6 +180,8 @@ class VibesClient:
         background_refresh: bool = False,
         refresh_interval: float = 1500.0,
         on_cookie_refresh: Optional[callable] = None,
+        on_session_expired: Optional[callable] = None,
+        auto_relogin: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -146,8 +189,11 @@ class VibesClient:
         self.auto_refresh = auto_refresh
         self.refresh_interval = refresh_interval
         self.on_cookie_refresh = on_cookie_refresh
+        self.on_session_expired = on_session_expired
+        self.auto_relogin = auto_relogin
         self._background_thread = None
         self._background_stop = None
+        self._session_expired = False
         self._set_cookie(meta_session, cookie_ack)
         if background_refresh:
             self.start_background_refresh()
@@ -164,9 +210,164 @@ class VibesClient:
             "Origin": self.base_url,
         })
         self._current_meta_session = meta_session
+        self._session_expired = False
+
+    def update_cookie(self, meta_session: str) -> None:
+        """Update the session cookie at runtime.
+
+        Use this when the ``on_session_expired`` callback fires and
+        you've obtained a fresh cookie (e.g., from the browser).
+        """
+        self._set_cookie(meta_session)
+        if self.on_cookie_refresh:
+            try:
+                self.on_cookie_refresh(meta_session)
+            except Exception:
+                pass
 
     def get_current_cookie(self) -> str:
         return self._current_meta_session
+
+    def _maybe_refresh_cookie(self, resp: requests.Response) -> None:
+        """Intercept Set-Cookie headers and update the session cookie.
+
+        Note: vibes.ai does NOT send Set-Cookie on regular API responses.
+        This is kept for completeness — if the server ever adds sliding
+        session behavior, this will automatically pick it up.
+        """
+        if not self.auto_refresh:
+            return
+        set_cookie = resp.headers.get("Set-Cookie") or resp.headers.get("set-cookie")
+        if not set_cookie:
+            return
+        for part in set_cookie.split(";"):
+            part = part.strip()
+            if part.startswith("meta_session="):
+                new_value = part[len("meta_session="):]
+                if new_value and new_value != self._current_meta_session:
+                    self._set_cookie(new_value)
+                    if self.on_cookie_refresh:
+                        try:
+                            self.on_cookie_refresh(new_value)
+                        except Exception:
+                            pass
+                break
+
+    def _handle_401(self) -> bool:
+        """Handle a 401 error — attempt auto re-login if enabled.
+
+        Returns True if the session was successfully restored.
+        """
+        self._session_expired = True
+
+        # Call the session expired callback
+        if self.on_session_expired:
+            try:
+                self.on_session_expired(self._current_meta_session)
+            except Exception:
+                pass
+
+        # Attempt auto re-login via headless browser
+        if self.auto_relogin:
+            new_cookie = self._attempt_oidc_relogin()
+            if new_cookie:
+                self._set_cookie(new_cookie)
+                if self.on_cookie_refresh:
+                    try:
+                        self.on_cookie_refresh(new_cookie)
+                    except Exception:
+                        pass
+                return True
+
+        return False
+
+    def _attempt_oidc_relogin(self) -> Optional[str]:
+        """Attempt to re-login via the OIDC flow using a headless browser.
+
+        This navigates to ``/api/meta-oidc/start`` which redirects to
+        Meta's OIDC login. If the browser has an active Meta session
+        (from facebook.com/meta.com cookies), the flow completes
+        automatically and a new ``meta_session`` cookie is set.
+
+        Returns the new cookie value, or None if re-login failed.
+        """
+        import subprocess, json as _json
+
+        try:
+            # Use agent-browser CLI to navigate to the OIDC start URL
+            # The browser must have Meta cookies for this to work
+            result = subprocess.run(
+                ["agent-browser", "open", f"{self.base_url}/api/meta-oidc/start"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+
+            # Wait for redirects to complete
+            import time as _time
+            _time.sleep(3)
+
+            # Get the current URL (should be back on vibes.ai)
+            result = subprocess.run(
+                ["agent-browser", "get", "url"],
+                capture_output=True, text=True, timeout=10,
+            )
+            current_url = result.stdout.strip()
+
+            # Check if we're back on vibes.ai (OIDC callback completed)
+            if "vibes.ai" not in current_url:
+                return None
+
+            # Extract the new meta_session cookie
+            result = subprocess.run(
+                ["agent-browser", "cookies"],
+                capture_output=True, text=True, timeout=10,
+            )
+            cookies_text = result.stdout.strip()
+            for line in cookies_text.split("\n"):
+                line = line.strip()
+                if line.startswith("meta_session="):
+                    new_cookie = line[len("meta_session="):]
+                    if new_cookie and new_cookie != "deleted":
+                        return new_cookie
+
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            pass
+
+        return None
+
+    def start_background_refresh(self) -> None:
+        """Start a daemon thread that periodically validates the session.
+
+        Calls ``/api/auth/check-token`` every ``refresh_interval`` seconds.
+        If the session is expired, triggers the ``on_session_expired`` callback.
+        """
+        import threading
+        if self._background_thread and self._background_thread.is_alive():
+            return
+        self._background_stop = threading.Event()
+
+        def _refresh_loop():
+            while not self._background_stop.wait(timeout=self.refresh_interval):
+                try:
+                    self._get("/api/auth/check-token")
+                except VibesAPIError as e:
+                    if e.status == 401:
+                        self._handle_401()
+                except Exception:
+                    pass
+
+        self._background_thread = threading.Thread(
+            target=_refresh_loop, daemon=True, name="vibes-session-keeper"
+        )
+        self._background_thread.start()
+
+    def stop_background_refresh(self) -> None:
+        if self._background_stop:
+            self._background_stop.set()
+        if self._background_thread:
+            self._background_thread.join(timeout=5)
+            self._background_thread = None
 
     def _maybe_refresh_cookie(self, resp: requests.Response) -> None:
         if not self.auto_refresh:
@@ -235,7 +436,6 @@ class VibesClient:
             else:
                 msg = f"HTTP {resp.status_code}"
                 code = None
-            # Include response body in error for debugging
             raise VibesAPIError(
                 f"{msg} | response={str(data)[:500]}",
                 status=resp.status_code, code=code, response=data,
@@ -244,11 +444,26 @@ class VibesClient:
 
     def _get(self, path: str, params: Optional[dict] = None, **kw) -> dict:
         resp = self.session.get(self._url(path), params=params, timeout=self.timeout, **kw)
-        return self._check(resp)
+        try:
+            return self._check(resp)
+        except VibesAPIError as e:
+            if e.status == 401 and not self._session_expired:
+                if self._handle_401():
+                    # Session was restored — retry the request
+                    resp = self.session.get(self._url(path), params=params, timeout=self.timeout, **kw)
+                    return self._check(resp)
+            raise
 
     def _post(self, path: str, json_body: Optional[dict] = None, **kw) -> dict:
         resp = self.session.post(self._url(path), json=json_body, timeout=self.timeout, **kw)
-        return self._check(resp)
+        try:
+            return self._check(resp)
+        except VibesAPIError as e:
+            if e.status == 401 and not self._session_expired:
+                if self._handle_401():
+                    resp = self.session.post(self._url(path), json=json_body, timeout=self.timeout, **kw)
+                    return self._check(resp)
+            raise
 
     def _put(self, path: str, json_body: Optional[dict] = None, **kw) -> dict:
         resp = self.session.put(self._url(path), json=json_body, timeout=self.timeout, **kw)
