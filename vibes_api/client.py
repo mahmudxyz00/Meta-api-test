@@ -295,29 +295,24 @@ class VibesClient:
     def _attempt_oidc_relogin(self) -> Optional[str]:
         """Attempt to re-login via the OIDC flow using auth.meta.com cookies.
 
-        This follows the full OIDC redirect chain:
-        1. vibes.ai/api/meta-oidc/start → gets oauth_csrf_token cookie
-        2. auth.meta.com/oidc → gets authorization code (using auth cookies)
-        3. auth.meta.ai/ecto → exchanges code for vibes.ai callback URL
-        4. vibes.ai/api/meta-oidc/callback → creates new session
-
-        Requires ``auth_meta_cookies`` to be set (auth.meta.com cookies).
+        Follows the full OIDC redirect chain using requests.get() (not Session)
+        to avoid cookie/header interference between steps.
 
         Returns the new meta_session cookie value, or None if re-login failed.
         """
         if not self.auth_meta_cookies:
             return None
 
+        ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+
         for attempt in range(3):
             try:
                 # Step 1: Start OIDC flow at vibes.ai
-                # Don't need a valid session for this — just need cookie_ack + get CSRF
-                s1 = requests.Session()
-                s1.headers.update({
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "Cookie": "cookie_ack=true",
-                })
-                r1 = s1.get(f"{self.base_url}/api/meta-oidc/start", allow_redirects=False, timeout=15)
+                r1 = requests.get(
+                    f"{self.base_url}/api/meta-oidc/start",
+                    headers={"User-Agent": ua, "Cookie": "cookie_ack=true"},
+                    allow_redirects=False, timeout=15,
+                )
                 if r1.status_code not in (302, 307):
                     if attempt < 2:
                         time.sleep(5)
@@ -329,77 +324,66 @@ class VibesClient:
 
                 # Extract oauth_csrf_token from Set-Cookie
                 csrf_token = None
-                set_cookie = r1.headers.get("Set-Cookie", "")
-                for part in set_cookie.split(";"):
-                    part = part.strip()
-                    if part.startswith("oauth_csrf_token="):
-                        csrf_token = part[len("oauth_csrf_token="):]
+                for part in r1.headers.get("Set-Cookie", "").split(";"):
+                    if part.strip().startswith("oauth_csrf_token="):
+                        csrf_token = part.strip()[len("oauth_csrf_token="):]
                         break
 
-                # Step 2: auth.meta.com — use ONLY auth.meta.com cookies
-                s2 = requests.Session()
-                s2.headers.update({
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "Cookie": self.auth_meta_cookies,
-                })
-                r2 = s2.get(redirect_url, allow_redirects=False, timeout=15)
+                # Step 2: auth.meta.com (with auth.meta.com cookies only)
+                r2 = requests.get(
+                    redirect_url,
+                    headers={"User-Agent": ua, "Cookie": self.auth_meta_cookies},
+                    allow_redirects=False, timeout=15,
+                )
                 if r2.status_code not in (302, 307):
-                    if attempt < 2:
-                        time.sleep(5)
-                        continue
+                    # 400 = auth.meta.com rate limited or cookies expired
+                    # Don't retry — makes rate limiting worse
                     return None
                 redirect2 = r2.headers.get("Location", "")
                 if not redirect2 or "code=" not in redirect2:
                     return None
 
                 # Step 3: auth.meta.ai/ecto (code exchange)
-                s3 = requests.Session()
-                s3.headers.update({
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                })
-                r3 = s3.get(redirect2, allow_redirects=False, timeout=15)
+                r3 = requests.get(
+                    redirect2,
+                    headers={"User-Agent": ua},
+                    allow_redirects=False, timeout=15,
+                )
                 if r3.status_code not in (302, 307):
                     return None
                 redirect3 = r3.headers.get("Location", "")
                 if not redirect3 or "vibes.ai" not in redirect3:
                     return None
 
-                # Step 4: vibes.ai callback — need CSRF token (NOT the old meta_session)
-                # The callback creates a NEW session, so we don't send the expired one
-                s4 = requests.Session()
-                s4.headers.update({
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                })
+                # Step 4: vibes.ai callback (CSRF token only, no old session)
                 callback_cookie = "cookie_ack=true"
                 if csrf_token:
                     callback_cookie += f";oauth_csrf_token={csrf_token}"
-                s4.headers.update({"Cookie": callback_cookie})
-                r4 = s4.get(redirect3, allow_redirects=False, timeout=15)
+                r4 = requests.get(
+                    redirect3,
+                    headers={"User-Agent": ua, "Cookie": callback_cookie},
+                    allow_redirects=False, timeout=15,
+                )
 
-                # Check for new meta_session in Set-Cookie from step 4
-                # The callback response sets the new session cookie
-                set_cookie_4 = r4.headers.get("Set-Cookie", "")
-                # Multiple cookies separated by comma — normalize
-                set_cookie_4 = set_cookie_4.replace(",", ";")
-                new_session = None
-                for part in set_cookie_4.split(";"):
+                # Check Set-Cookie for new meta_session
+                set_cookie = r4.headers.get("Set-Cookie", "").replace(",", ";")
+                for part in set_cookie.split(";"):
                     part = part.strip()
                     if part.startswith("meta_session="):
                         val = part[len("meta_session="):]
                         if val and val != "deleted" and val != self._current_meta_session:
-                            new_session = val
-                            break
+                            return val
 
-                if new_session:
-                    return new_session
-
-                # Step 5: Follow final redirect (in case session is set there)
+                # Step 5: Follow final redirect if no cookie in step 4
                 final_redirect = r4.headers.get("Location", "")
                 if final_redirect and "error=" not in final_redirect:
                     if not final_redirect.startswith("http"):
                         final_redirect = f"{self.base_url}{final_redirect}"
-                    s4.headers.update({"Cookie": "cookie_ack=true"})
-                    r5 = s4.get(final_redirect, allow_redirects=True, timeout=15)
+                    r5 = requests.get(
+                        final_redirect,
+                        headers={"User-Agent": ua, "Cookie": "cookie_ack=true"},
+                        allow_redirects=True, timeout=15,
+                    )
                     set_cookie_5 = r5.headers.get("Set-Cookie", "").replace(",", ";")
                     for part in set_cookie_5.split(";"):
                         part = part.strip()
