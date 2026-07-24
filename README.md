@@ -10,7 +10,7 @@ This package was built by reverse-engineering the vibes.ai Next.js bundles and o
 
 ```bash
 # 1) Install
-pip install -e /home/z/my-project/download/vibes-api
+pip install VibesAI-api
 
 # 2) Set your cookie (grab from DevTools → Application → Cookies → vibes.ai)
 export VIBES_META_SESSION="e60e910a-242a-...-K54E"
@@ -536,7 +536,7 @@ python /home/z/my-project/download/vibes-api/examples/01_generate_video.py
 
 ```bash
 # Install in editable mode
-pip install -e /home/z/my-project/download/vibes-api
+pip install VibesAI-api
 
 # Run tests (requires VIBES_META_SESSION env var)
 pytest
