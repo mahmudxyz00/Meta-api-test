@@ -182,6 +182,7 @@ class VibesClient:
         on_cookie_refresh: Optional[callable] = None,
         on_session_expired: Optional[callable] = None,
         auto_relogin: bool = False,
+        auth_meta_cookies: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -191,6 +192,7 @@ class VibesClient:
         self.on_cookie_refresh = on_cookie_refresh
         self.on_session_expired = on_session_expired
         self.auto_relogin = auto_relogin
+        self.auth_meta_cookies = auth_meta_cookies
         self._background_thread = None
         self._background_stop = None
         self._session_expired = False
@@ -213,11 +215,7 @@ class VibesClient:
         self._session_expired = False
 
     def update_cookie(self, meta_session: str) -> None:
-        """Update the session cookie at runtime.
-
-        Use this when the ``on_session_expired`` callback fires and
-        you've obtained a fresh cookie (e.g., from the browser).
-        """
+        """Update the session cookie at runtime."""
         self._set_cookie(meta_session)
         if self.on_cookie_refresh:
             try:
@@ -225,16 +223,24 @@ class VibesClient:
             except Exception:
                 pass
 
+    def set_auth_meta_cookies(self, cookies: str) -> None:
+        """Set the auth.meta.com cookies for automatic re-login.
+
+        Parameters
+        ----------
+        cookies : str
+            Cookie string from auth.meta.com (e.g.,
+            ``"ps_n=1;datr=...;fs=...;locale=en_GB;ps_l=1"``).
+            Get these from DevTools → Application → Cookies → auth.meta.com.
+        """
+        self.auth_meta_cookies = cookies
+        self.auto_relogin = True  # Enable auto re-login
+
     def get_current_cookie(self) -> str:
         return self._current_meta_session
 
     def _maybe_refresh_cookie(self, resp: requests.Response) -> None:
-        """Intercept Set-Cookie headers and update the session cookie.
-
-        Note: vibes.ai does NOT send Set-Cookie on regular API responses.
-        This is kept for completeness — if the server ever adds sliding
-        session behavior, this will automatically pick it up.
-        """
+        """Intercept Set-Cookie headers and update the session cookie."""
         if not self.auto_refresh:
             return
         set_cookie = resp.headers.get("Set-Cookie") or resp.headers.get("set-cookie")
@@ -260,14 +266,12 @@ class VibesClient:
         """
         self._session_expired = True
 
-        # Call the session expired callback
         if self.on_session_expired:
             try:
                 self.on_session_expired(self._current_meta_session)
             except Exception:
                 pass
 
-        # Attempt auto re-login via headless browser
         if self.auto_relogin:
             new_cookie = self._attempt_oidc_relogin()
             if new_cookie:
@@ -282,57 +286,118 @@ class VibesClient:
         return False
 
     def _attempt_oidc_relogin(self) -> Optional[str]:
-        """Attempt to re-login via the OIDC flow using a headless browser.
+        """Attempt to re-login via the OIDC flow using auth.meta.com cookies.
 
-        This navigates to ``/api/meta-oidc/start`` which redirects to
-        Meta's OIDC login. If the browser has an active Meta session
-        (from facebook.com/meta.com cookies), the flow completes
-        automatically and a new ``meta_session`` cookie is set.
+        This follows the full OIDC redirect chain:
+        1. vibes.ai/api/meta-oidc/start → gets oauth_csrf_token cookie
+        2. auth.meta.com/oidc → gets authorization code (using auth cookies)
+        3. auth.meta.ai/ecto → exchanges code for vibes.ai callback URL
+        4. vibes.ai/api/meta-oidc/callback → creates new session
 
-        Returns the new cookie value, or None if re-login failed.
+        Requires ``auth_meta_cookies`` to be set (auth.meta.com cookies).
+
+        Returns the new meta_session cookie value, or None if re-login failed.
         """
-        import subprocess, json as _json
+        if not self.auth_meta_cookies:
+            return None
 
-        try:
-            # Use agent-browser CLI to navigate to the OIDC start URL
-            # The browser must have Meta cookies for this to work
-            result = subprocess.run(
-                ["agent-browser", "open", f"{self.base_url}/api/meta-oidc/start"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
+        for attempt in range(3):
+            try:
+                # Step 1: Start OIDC flow at vibes.ai (get CSRF token + redirect URL)
+                s1 = requests.Session()
+                s1.headers.update({
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Cookie": f"meta_session={self._current_meta_session};cookie_ack=true",
+                })
+                r1 = s1.get(f"{self.base_url}/api/meta-oidc/start", allow_redirects=False, timeout=15)
+                if r1.status_code not in (302, 307):
+                    if attempt < 2:
+                        time.sleep(5)
+                        continue
+                    return None
+                redirect_url = r1.headers.get("Location", "")
+                if not redirect_url:
+                    return None
+
+                # Extract oauth_csrf_token from Set-Cookie
+                csrf_token = None
+                set_cookie = r1.headers.get("Set-Cookie", "")
+                for part in set_cookie.split(";"):
+                    part = part.strip()
+                    if part.startswith("oauth_csrf_token="):
+                        csrf_token = part[len("oauth_csrf_token="):]
+                        break
+
+                # Step 2: auth.meta.com — use ONLY auth.meta.com cookies (no vibes.ai cookies)
+                s2 = requests.Session()
+                s2.headers.update({
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Cookie": self.auth_meta_cookies,
+                })
+                r2 = s2.get(redirect_url, allow_redirects=False, timeout=15)
+                if r2.status_code not in (302, 307):
+                    if attempt < 2:
+                        time.sleep(5)
+                        continue
+                    return None
+                redirect2 = r2.headers.get("Location", "")
+                if not redirect2 or "code=" not in redirect2:
+                    return None
+
+                # Step 3: auth.meta.ai/ecto (code exchange) — no cookies needed
+                s3 = requests.Session()
+                s3.headers.update({
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                })
+                r3 = s3.get(redirect2, allow_redirects=False, timeout=15)
+                if r3.status_code not in (302, 307):
+                    return None
+                redirect3 = r3.headers.get("Location", "")
+                if not redirect3 or "vibes.ai" not in redirect3:
+                    return None
+
+                # Step 4: vibes.ai callback — need vibes.ai cookies + CSRF token
+                s4 = requests.Session()
+                s4.headers.update({
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                })
+                callback_cookie = f"meta_session={self._current_meta_session};cookie_ack=true"
+                if csrf_token:
+                    callback_cookie += f";oauth_csrf_token={csrf_token}"
+                s4.headers.update({"Cookie": callback_cookie})
+                r4 = s4.get(redirect3, allow_redirects=False, timeout=15)
+
+                # Step 5: Follow final redirect
+                r5 = None
+                final_redirect = r4.headers.get("Location", "")
+                if final_redirect and "error=" not in final_redirect:
+                    if not final_redirect.startswith("http"):
+                        final_redirect = f"{self.base_url}{final_redirect}"
+                    s4.headers.update({"Cookie": f"meta_session={self._current_meta_session};cookie_ack=true"})
+                    r5 = s4.get(final_redirect, allow_redirects=True, timeout=15)
+
+                # Check for new meta_session in Set-Cookie headers from step 4 and 5
+                responses = [r4]
+                if r5 is not None:
+                    responses.append(r5)
+                for resp in responses:
+                    set_cookie = resp.headers.get("Set-Cookie", "")
+                    # Multiple cookies are separated by comma — replace with semicolon for parsing
+                    set_cookie = set_cookie.replace(",", ";")
+                    for part in set_cookie.split(";"):
+                        part = part.strip()
+                        if part.startswith("meta_session="):
+                            val = part[len("meta_session="):]
+                            if val and val != "deleted" and val != self._current_meta_session:
+                                return val
+
                 return None
 
-            # Wait for redirects to complete
-            import time as _time
-            _time.sleep(3)
-
-            # Get the current URL (should be back on vibes.ai)
-            result = subprocess.run(
-                ["agent-browser", "get", "url"],
-                capture_output=True, text=True, timeout=10,
-            )
-            current_url = result.stdout.strip()
-
-            # Check if we're back on vibes.ai (OIDC callback completed)
-            if "vibes.ai" not in current_url:
-                return None
-
-            # Extract the new meta_session cookie
-            result = subprocess.run(
-                ["agent-browser", "cookies"],
-                capture_output=True, text=True, timeout=10,
-            )
-            cookies_text = result.stdout.strip()
-            for line in cookies_text.split("\n"):
-                line = line.strip()
-                if line.startswith("meta_session="):
-                    new_cookie = line[len("meta_session="):]
-                    if new_cookie and new_cookie != "deleted":
-                        return new_cookie
-
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-            pass
+            except Exception:
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                pass
 
         return None
 
