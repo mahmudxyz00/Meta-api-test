@@ -264,6 +264,10 @@ class VibesClient:
 
         Returns True if the session was successfully restored.
         """
+        # Don't retry re-login if we're already in the middle of one
+        if self._session_expired:
+            return False
+
         self._session_expired = True
 
         if self.on_session_expired:
@@ -272,9 +276,10 @@ class VibesClient:
             except Exception:
                 pass
 
-        if self.auto_relogin:
+        if self.auto_relogin and self.auth_meta_cookies:
             new_cookie = self._attempt_oidc_relogin()
             if new_cookie:
+                # _set_cookie resets _session_expired to False
                 self._set_cookie(new_cookie)
                 if self.on_cookie_refresh:
                     try:
@@ -283,6 +288,8 @@ class VibesClient:
                         pass
                 return True
 
+        # Reset the flag so future 401s can attempt re-login again
+        self._session_expired = False
         return False
 
     def _attempt_oidc_relogin(self) -> Optional[str]:
@@ -303,11 +310,12 @@ class VibesClient:
 
         for attempt in range(3):
             try:
-                # Step 1: Start OIDC flow at vibes.ai (get CSRF token + redirect URL)
+                # Step 1: Start OIDC flow at vibes.ai
+                # Don't need a valid session for this — just need cookie_ack + get CSRF
                 s1 = requests.Session()
                 s1.headers.update({
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "Cookie": f"meta_session={self._current_meta_session};cookie_ack=true",
+                    "Cookie": "cookie_ack=true",
                 })
                 r1 = s1.get(f"{self.base_url}/api/meta-oidc/start", allow_redirects=False, timeout=15)
                 if r1.status_code not in (302, 307):
@@ -328,7 +336,7 @@ class VibesClient:
                         csrf_token = part[len("oauth_csrf_token="):]
                         break
 
-                # Step 2: auth.meta.com — use ONLY auth.meta.com cookies (no vibes.ai cookies)
+                # Step 2: auth.meta.com — use ONLY auth.meta.com cookies
                 s2 = requests.Session()
                 s2.headers.update({
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -344,7 +352,7 @@ class VibesClient:
                 if not redirect2 or "code=" not in redirect2:
                     return None
 
-                # Step 3: auth.meta.ai/ecto (code exchange) — no cookies needed
+                # Step 3: auth.meta.ai/ecto (code exchange)
                 s3 = requests.Session()
                 s3.headers.update({
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -356,35 +364,44 @@ class VibesClient:
                 if not redirect3 or "vibes.ai" not in redirect3:
                     return None
 
-                # Step 4: vibes.ai callback — need vibes.ai cookies + CSRF token
+                # Step 4: vibes.ai callback — need CSRF token (NOT the old meta_session)
+                # The callback creates a NEW session, so we don't send the expired one
                 s4 = requests.Session()
                 s4.headers.update({
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
                 })
-                callback_cookie = f"meta_session={self._current_meta_session};cookie_ack=true"
+                callback_cookie = "cookie_ack=true"
                 if csrf_token:
                     callback_cookie += f";oauth_csrf_token={csrf_token}"
                 s4.headers.update({"Cookie": callback_cookie})
                 r4 = s4.get(redirect3, allow_redirects=False, timeout=15)
 
-                # Step 5: Follow final redirect
-                r5 = None
+                # Check for new meta_session in Set-Cookie from step 4
+                # The callback response sets the new session cookie
+                set_cookie_4 = r4.headers.get("Set-Cookie", "")
+                # Multiple cookies separated by comma — normalize
+                set_cookie_4 = set_cookie_4.replace(",", ";")
+                new_session = None
+                for part in set_cookie_4.split(";"):
+                    part = part.strip()
+                    if part.startswith("meta_session="):
+                        val = part[len("meta_session="):]
+                        if val and val != "deleted" and val != self._current_meta_session:
+                            new_session = val
+                            break
+
+                if new_session:
+                    return new_session
+
+                # Step 5: Follow final redirect (in case session is set there)
                 final_redirect = r4.headers.get("Location", "")
                 if final_redirect and "error=" not in final_redirect:
                     if not final_redirect.startswith("http"):
                         final_redirect = f"{self.base_url}{final_redirect}"
-                    s4.headers.update({"Cookie": f"meta_session={self._current_meta_session};cookie_ack=true"})
+                    s4.headers.update({"Cookie": "cookie_ack=true"})
                     r5 = s4.get(final_redirect, allow_redirects=True, timeout=15)
-
-                # Check for new meta_session in Set-Cookie headers from step 4 and 5
-                responses = [r4]
-                if r5 is not None:
-                    responses.append(r5)
-                for resp in responses:
-                    set_cookie = resp.headers.get("Set-Cookie", "")
-                    # Multiple cookies are separated by comma — replace with semicolon for parsing
-                    set_cookie = set_cookie.replace(",", ";")
-                    for part in set_cookie.split(";"):
+                    set_cookie_5 = r5.headers.get("Set-Cookie", "").replace(",", ";")
+                    for part in set_cookie_5.split(";"):
                         part = part.strip()
                         if part.startswith("meta_session="):
                             val = part[len("meta_session="):]
@@ -514,9 +531,10 @@ class VibesClient:
         except VibesAPIError as e:
             if e.status == 401 and not self._session_expired:
                 if self._handle_401():
-                    # Session was restored — retry the request
+                    # Session was restored — retry the request ONCE
                     resp = self.session.get(self._url(path), params=params, timeout=self.timeout, **kw)
                     return self._check(resp)
+            # Re-login failed or not enabled — raise the original error
             raise
 
     def _post(self, path: str, json_body: Optional[dict] = None, **kw) -> dict:
