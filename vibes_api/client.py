@@ -303,7 +303,7 @@ class VibesClient:
         if not self.auth_meta_cookies:
             return None
 
-        ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        ua = "Mozilla/5.0"
 
         for attempt in range(3):
             try:
