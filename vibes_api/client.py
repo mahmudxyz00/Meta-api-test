@@ -611,7 +611,18 @@ class VibesClient:
         return self._put(f"/api/projects/{project_id}", json_body=body).get("project", {})
 
     def delete_project(self, project_id: str, delete_assets: bool = False) -> None:
-        """Delete a project. Set ``delete_assets=True`` to also remove its media."""
+        """Delete a project.
+
+        Parameters
+        ----------
+        project_id : str
+            The project to delete.
+        delete_assets : bool, default False
+            If True, also delete media that is NOT used in any other project
+            ("Delete project and unused media"). If False, only delete the
+            project itself and keep all media in the library
+            ("Delete project only").
+        """
         path = f"/api/projects/{project_id}"
         if delete_assets:
             path += "?deleteAssets=true"
@@ -1931,6 +1942,19 @@ class VibesClient:
         """
         return self._post("/api/upload-image", json_body={"image": image_base64})
 
+    def upload_asset(self, image_base64: str) -> dict:
+        """Upload a base64-encoded image as a generic asset.
+
+        Used for playable thumbnails and preview video thumbnails.
+        Returns ``{mediaEntId}``.
+
+        Parameters
+        ----------
+        image_base64 : str
+            Base64-encoded image data (no data: prefix).
+        """
+        return self._post("/api/upload-asset", json_body={"image": image_base64})
+
     def upload_image_file(self, path: str) -> dict:
         """Read an image file from disk and upload it."""
         with open(path, "rb") as f:
@@ -3150,6 +3174,51 @@ class VibesClient:
         if resolved_code:
             body["resolvedCode"] = resolved_code
         return self._post(f"/api/playables/{playable_id}/thumbnail", json_body=body)
+
+    def upload_playable_thumbnail(
+        self,
+        playable_id: str,
+        media_ent_id: str,
+    ) -> dict:
+        """Upload an existing media asset as a playable's thumbnail.
+
+        Parameters
+        ----------
+        playable_id : str
+            The playable ID.
+        media_ent_id : str
+            The ``mediaEntId`` from ``upload_image()`` or ``upload_asset()``.
+        """
+        return self._post(
+            f"/api/playables/{playable_id}/thumbnail/upload",
+            json_body={"mediaEntId": media_ent_id},
+        )
+
+    def upload_playable_preview_video(
+        self,
+        playable_id: str,
+        media_ent_id: str,
+        thumbnail_media_ent_id: Optional[str] = None,
+    ) -> dict:
+        """Upload a preview video to a playable.
+
+        Parameters
+        ----------
+        playable_id : str
+            The playable ID.
+        media_ent_id : str
+            The ``mediaEntId`` from ``upload_video_direct()``.
+        thumbnail_media_ent_id : str, optional
+            The ``mediaEntId`` of the video's thumbnail (from
+            ``upload_asset()`` with a frame extracted from the video).
+        """
+        body: Dict[str, Any] = {"mediaEntId": media_ent_id}
+        if thumbnail_media_ent_id:
+            body["thumbnailMediaEntId"] = thumbnail_media_ent_id
+        return self._post(
+            f"/api/playables/{playable_id}/preview-video/upload",
+            json_body=body,
+        )
 
     # ------------------------------------------------------------------ #
     #  Multi-turn timeline chat (conversation_id reuse + tool results)

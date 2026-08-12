@@ -42,9 +42,9 @@ class TestImports(unittest.TestCase):
         for name in vibes_api.__all__:
             self.assertTrue(hasattr(vibes_api, name), f"Missing export: {name}")
 
-    def test_version_is_1_5_0(self):
+    def test_version_is_1_5_1(self):
         import vibes_api
-        self.assertEqual(vibes_api.__version__, "1.5.0")
+        self.assertEqual(vibes_api.__version__, "1.5.1")
 
     def test_no_syntax_errors(self):
         import vibes_api.client
